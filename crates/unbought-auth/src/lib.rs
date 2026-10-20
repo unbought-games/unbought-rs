@@ -117,7 +117,10 @@ pub fn random_secret() -> String {
     CsrfToken::new_random().secret().to_owned()
 }
 pub fn safe_return_path(path: &str) -> bool {
-    path.starts_with('/') && !path.starts_with("//") && !path.contains(['\\', '\r', '\n'])
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains('\\')
+        && !path.bytes().any(|byte| byte.is_ascii_control())
 }
 pub fn require_verified(identity: &Identity) -> Result<()> {
     if identity.email_verified {
@@ -232,6 +235,11 @@ impl RelyingParty {
             )
             .await?
             .ok_or(Error::Transaction)?;
+        // Recheck transactions created before a validator upgrade, before any
+        // provider request or use of their stored destination in a redirect.
+        if !safe_return_path(&transaction.return_path) {
+            return Err(Error::Invalid);
+        }
         let client = CoreClient::from_provider_metadata(
             self.metadata().await?,
             ClientId::new(self.config.client_id.clone()),

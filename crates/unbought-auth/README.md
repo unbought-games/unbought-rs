@@ -44,8 +44,9 @@ Keep `Tokens` server-side; their serialized representation includes credentials.
 
 - `RelyingParty::begin` saves a ten-minute login transaction and returns the
   provider authorization URL. Bind the browser secret to the initiating browser.
-- `RelyingParty::callback` checks the response issuer and consumes the transaction
-  before exchanging the code. It returns `Tokens` and the saved local return path.
+- `RelyingParty::callback` checks the response issuer, consumes the transaction,
+  and revalidates its local return path before exchanging the code. It returns
+  `Tokens` and the saved local return path.
 - `RelyingParty::refresh` refreshes tokens while preserving identity continuity.
 - `RelyingParty::revalidate` reuses an unexpired snapshot for less than 60 seconds;
   otherwise it refreshes. Call this before admitting authenticated game commands.
@@ -57,7 +58,8 @@ Keep `Tokens` server-side; their serialized representation includes credentials.
   automatically required by the login flow.
 
 `safe_return_path` accepts local absolute paths, rejecting scheme-relative URLs,
-backslashes and CR/LF. Pass its result directly as the saved local destination;
+backslashes and all ASCII control characters, including tabs that browsers remove
+when parsing URLs. Pass the validated path directly as the saved local destination;
 do not turn it into an external URL by decoding or rewriting it afterward.
 
 ## Provider contract

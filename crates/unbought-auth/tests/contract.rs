@@ -1,6 +1,11 @@
+use std::{
+    future::Future,
+    sync::Mutex,
+    task::{Context, Poll, Waker},
+};
 use unbought_auth::{
-    Configuration, Error, Identity, Logout, RelyingParty, replace_identity, require_verified,
-    safe_return_path,
+    Configuration, Error, Identity, LoginStore, LoginTransaction, Logout, RelyingParty,
+    replace_identity, require_verified, safe_return_path,
 };
 
 fn configuration(issuer: &str, redirect_uri: &str) -> Configuration {
@@ -114,6 +119,7 @@ fn return_destinations_reject_external_urls_and_header_injection() {
         "https://example.com",
         "//example.com",
         "/\\example.com",
+        "/\t/example.com",
         "/game\rLocation: elsewhere",
         "/game\nLocation: elsewhere",
     ] {
@@ -122,6 +128,90 @@ fn return_destinations_reject_external_urls_and_header_injection() {
     for path in ["/", "/game", "/game?tab=fleets#current"] {
         assert!(safe_return_path(path), "{path}");
     }
+}
+
+#[test]
+fn return_destinations_reject_browser_url_normalization_bypasses() {
+    let base = url::Url::parse("https://game.example").unwrap();
+    let tab_destination = "/\t/elsewhere.example";
+    assert_eq!(
+        base.join(tab_destination).unwrap().host_str(),
+        Some("elsewhere.example")
+    );
+    assert!(!safe_return_path(tab_destination));
+    for control in (0u8..=31).chain(std::iter::once(127)) {
+        assert!(!safe_return_path(&format!(
+            "/{}/elsewhere.example",
+            char::from(control)
+        )));
+        assert!(!safe_return_path(&format!(
+            "/game?tab={}fleets",
+            char::from(control)
+        )));
+    }
+    // Encoded path characters stay encoded when used directly as a Location.
+    for path in ["/%09/elsewhere.example", "/game?tab=fleets", "/galaxy/é"] {
+        assert!(safe_return_path(path));
+        assert_eq!(base.join(path).unwrap().origin(), base.origin());
+    }
+}
+
+struct LegacyLogin(Mutex<Option<LoginTransaction>>);
+impl LoginStore for LegacyLogin {
+    async fn insert(&self, _: LoginTransaction) -> unbought_auth::Result<()> {
+        panic!("unsafe login must not be saved")
+    }
+    async fn consume(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: i64,
+    ) -> unbought_auth::Result<Option<LoginTransaction>> {
+        Ok(self.0.lock().unwrap().take())
+    }
+}
+
+#[test]
+fn unsafe_destinations_are_rejected_before_network_and_after_legacy_consumption() {
+    let party = RelyingParty::new(configuration(
+        "https://accounts.example",
+        "https://game.example/callback",
+    ))
+    .unwrap();
+    let store = LegacyLogin(Mutex::new(Some(LoginTransaction {
+        issuer: "https://accounts.example".into(),
+        client_id: "game".into(),
+        state_hash: "state".into(),
+        browser_hash: "browser".into(),
+        nonce: "nonce".into(),
+        pkce_verifier: "verifier".into(),
+        return_path: "/\t/elsewhere.example".into(),
+        expected_subject: None,
+        expires_at: i64::MAX,
+    })));
+    let mut context = Context::from_waker(Waker::noop());
+    let mut begin = std::pin::pin!(party.begin(&store, "browser", "/\t/elsewhere.example", None));
+    assert!(matches!(
+        begin.as_mut().poll(&mut context),
+        Poll::Ready(Err(Error::Invalid))
+    ));
+    let mut callback = std::pin::pin!(party.callback(
+        &store,
+        "browser",
+        "state",
+        "code",
+        "https://accounts.example"
+    ));
+    assert!(matches!(
+        callback.as_mut().poll(&mut context),
+        Poll::Ready(Err(Error::Invalid))
+    ));
+    assert!(
+        store.0.lock().unwrap().is_none(),
+        "legacy transaction was consumed exactly once"
+    );
 }
 
 #[test]
