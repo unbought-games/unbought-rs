@@ -1,0 +1,10 @@
+[workspace]
+members = ["crates/unbought-auth"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/unbought-games/unbought-rs"
+
