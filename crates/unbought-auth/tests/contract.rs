@@ -174,6 +174,43 @@ impl LoginStore for LegacyLogin {
 }
 
 #[test]
+fn token_operations_can_be_awaited_in_send_handlers() {
+    fn require_send(_: impl Future + Send + 'static) {}
+    let party = RelyingParty::new(configuration(
+        "https://accounts.example",
+        "https://game.example/callback",
+    ))
+    .unwrap();
+    let tokens = unbought_auth::Tokens {
+        client_id: "game".into(),
+        identity: identity(),
+        access_token: "access".into(),
+        refresh_token: Some("refresh".into()),
+        nonce: "nonce".into(),
+        validated_at: 0,
+    };
+    // Compile the same outer async shape required by HTTP handlers. These
+    // futures are deliberately not polled and never contact the provider.
+    let callback_party = party.clone();
+    require_send(async move {
+        let store = LegacyLogin(Mutex::new(None));
+        callback_party
+            .callback(
+                &store,
+                "browser",
+                "state",
+                "code",
+                "https://accounts.example",
+            )
+            .await
+    });
+    let refresh_party = party.clone();
+    let refresh_tokens = tokens.clone();
+    require_send(async move { refresh_party.refresh(&refresh_tokens).await });
+    require_send(async move { party.revalidate(&tokens).await });
+}
+
+#[test]
 fn unsafe_destinations_are_rejected_before_network_and_after_legacy_consumption() {
     let party = RelyingParty::new(configuration(
         "https://accounts.example",
