@@ -105,3 +105,7 @@ failure. Orbit already maps `Unavailable` to HTTP 503. The library does not forw
 provider retry headers; callers should use backoff for unavailable responses.
 Publish this patch through the repository release procedure, then update consumers'
 registry pins and lockfiles in their own reviewed release.
+
+Version 0.1.3 keeps callback, refresh, and revalidation futures `Send` when awaited
+inside HTTP handlers. It replaces the 0.1.2 closure adapter with an explicit HTTP
+client adapter; transient failure classification is unchanged.

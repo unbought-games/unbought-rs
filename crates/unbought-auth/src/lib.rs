@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     future::Future,
+    pin::Pin,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -165,16 +166,23 @@ fn token_error(error: CoreRequestTokenError<Error>) -> Error {
     }
 }
 
-impl RelyingParty {
-    async fn token_http(&self, request: HttpRequest) -> Result<HttpResponse> {
-        let response = self
-            .http
-            .call(request)
-            .await
-            .map_err(|_| Error::Unavailable)?;
-        token_http_response(response)
-    }
+// A concrete adapter keeps the HTTP future's Send bound visible to consumers
+// such as Axum, including when callback/refresh are awaited inside a handler.
+struct TokenHttpClient<'a>(&'a reqwest::Client);
 
+impl<'c> AsyncHttpClient<'c> for TokenHttpClient<'_> {
+    type Error = Error;
+    type Future = Pin<Box<dyn Future<Output = Result<HttpResponse>> + Send + 'c>>;
+
+    fn call(&'c self, request: HttpRequest) -> Self::Future {
+        Box::pin(async move {
+            let response = self.0.call(request).await.map_err(|_| Error::Unavailable)?;
+            token_http_response(response)
+        })
+    }
+}
+
+impl RelyingParty {
     pub fn new(config: Configuration) -> Result<Self> {
         for value in [&config.issuer, &config.redirect_uri] {
             let url = url::Url::parse(value).map_err(|_| Error::Invalid)?;
@@ -286,7 +294,7 @@ impl RelyingParty {
             .exchange_code(AuthorizationCode::new(code.into()))
             .map_err(|_| Error::Invalid)?
             .set_pkce_verifier(PkceCodeVerifier::new(transaction.pkce_verifier))
-            .request_async(&|request| self.token_http(request))
+            .request_async(&TokenHttpClient(&self.http))
             .await
             .map_err(token_error)?;
         let id_token = response.id_token().ok_or(Error::Invalid)?;
@@ -372,7 +380,7 @@ impl RelyingParty {
                 tokens.refresh_token.clone().ok_or(Error::Invalid)?,
             ))
             .map_err(|_| Error::Invalid)?
-            .request_async(&|request| self.token_http(request))
+            .request_async(&TokenHttpClient(&self.http))
             .await
             .map_err(token_error)?;
         let id_token = response.id_token().ok_or(Error::Invalid)?;
