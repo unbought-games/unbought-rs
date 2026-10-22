@@ -2,10 +2,10 @@
 #![doc = include_str!("../README.md")]
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use openidconnect::{
-    AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
-    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope,
-    TokenResponse,
-    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
+    AccessTokenHash, AsyncHttpClient, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
+    HttpRequest, HttpResponse, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, RefreshToken, RequestTokenError, Scope, TokenResponse,
+    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata, CoreRequestTokenError},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -140,7 +140,41 @@ pub fn replace_identity(current: &Identity, next: Identity) -> Result<Identity> 
     }
     Ok(next)
 }
+// Inspect HTTP status before OAuth parsing discards it. Accounts throttling has
+// a JSON message body, and reverse proxies may return HTML on outages.
+fn token_http_response(response: HttpResponse) -> Result<HttpResponse> {
+    if response.status().as_u16() == 429 || response.status().is_server_error() {
+        Err(Error::Unavailable)
+    } else {
+        Ok(response)
+    }
+}
+
+fn token_error(error: CoreRequestTokenError<Error>) -> Error {
+    match error {
+        RequestTokenError::Request(_) => Error::Unavailable,
+        RequestTokenError::ServerResponse(response)
+            if matches!(
+                response.error().as_ref(),
+                "temporarily_unavailable" | "server_error"
+            ) =>
+        {
+            Error::Unavailable
+        }
+        _ => Error::Invalid,
+    }
+}
+
 impl RelyingParty {
+    async fn token_http(&self, request: HttpRequest) -> Result<HttpResponse> {
+        let response = self
+            .http
+            .call(request)
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        token_http_response(response)
+    }
+
     pub fn new(config: Configuration) -> Result<Self> {
         for value in [&config.issuer, &config.redirect_uri] {
             let url = url::Url::parse(value).map_err(|_| Error::Invalid)?;
@@ -252,9 +286,9 @@ impl RelyingParty {
             .exchange_code(AuthorizationCode::new(code.into()))
             .map_err(|_| Error::Invalid)?
             .set_pkce_verifier(PkceCodeVerifier::new(transaction.pkce_verifier))
-            .request_async(&self.http)
+            .request_async(&|request| self.token_http(request))
             .await
-            .map_err(|_| Error::Invalid)?;
+            .map_err(token_error)?;
         let id_token = response.id_token().ok_or(Error::Invalid)?;
         let verifier = client.id_token_verifier();
         let claims = id_token
@@ -338,9 +372,9 @@ impl RelyingParty {
                 tokens.refresh_token.clone().ok_or(Error::Invalid)?,
             ))
             .map_err(|_| Error::Invalid)?
-            .request_async(&self.http)
+            .request_async(&|request| self.token_http(request))
             .await
-            .map_err(|_| Error::Unavailable)?;
+            .map_err(token_error)?;
         let id_token = response.id_token().ok_or(Error::Invalid)?;
         id_token
             .claims(&client.id_token_verifier(), |nonce: Option<&Nonce>| {
@@ -460,5 +494,74 @@ mod tests {
         let mut other = i.clone();
         other.subject = "other".into();
         assert!(replace_identity(&i, other).is_err());
+    }
+}
+
+#[cfg(test)]
+mod token_error_tests {
+    use super::*;
+    use openidconnect::{StandardErrorResponse, core::CoreErrorResponseType};
+
+    #[test]
+    fn throttling_and_outages_are_transient_regardless_of_body() {
+        for status in [429, 500, 502, 503, 504] {
+            for body in [
+                br#"{"message":"Too many requests"}"#.as_slice(),
+                b"<html>Unavailable</html>",
+                b"",
+            ] {
+                let response = openidconnect::http::Response::builder()
+                    .status(status)
+                    .body(body.to_vec())
+                    .unwrap();
+                assert!(matches!(
+                    token_http_response(response),
+                    Err(Error::Unavailable)
+                ));
+            }
+        }
+        assert!(matches!(
+            token_error(RequestTokenError::Request(Error::Unavailable)),
+            Error::Unavailable
+        ));
+    }
+
+    #[test]
+    fn credentials_and_account_errors_remain_invalid() {
+        for status in [200, 400, 401, 403] {
+            let response = openidconnect::http::Response::builder()
+                .status(status)
+                .body(Vec::new())
+                .unwrap();
+            assert_eq!(
+                token_http_response(response).unwrap().status().as_u16(),
+                status
+            );
+        }
+        for code in [
+            "invalid_grant",
+            "invalid_client",
+            "access_denied",
+            "account_action_required",
+        ] {
+            let response: StandardErrorResponse<CoreErrorResponseType> =
+                serde_json::from_value(serde_json::json!({"error": code})).unwrap();
+            assert!(matches!(
+                token_error(RequestTokenError::ServerResponse(response)),
+                Error::Invalid
+            ));
+        }
+        for code in ["temporarily_unavailable", "server_error"] {
+            let response: StandardErrorResponse<CoreErrorResponseType> =
+                serde_json::from_value(serde_json::json!({"error": code})).unwrap();
+            assert!(matches!(
+                token_error(RequestTokenError::ServerResponse(response)),
+                Error::Unavailable
+            ));
+        }
+        assert!(matches!(
+            token_error(RequestTokenError::Other("malformed response".into())),
+            Error::Invalid
+        ));
     }
 }
