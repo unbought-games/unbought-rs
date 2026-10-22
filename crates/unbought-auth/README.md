@@ -81,12 +81,49 @@ key ID, issuer and audience, and nonempty `sid` and `jti` claims. The
 object. A nonce claim is forbidden, including JSON null. Consumers must retain
 the replay-protection records for the token's possible acceptance window.
 
+## Optional supporter display
+
+`Identity.supporter_tier: Option<u8>` exposes the optional ID-token claim
+`https://unbought.games/supporter_tier` (also available as `SUPPORTER_TIER_CLAIM`).
+Only integer values `1`, `2`, and `3` are recognized; all three indicate a
+supporter. Missing, null, malformed, or unrecognized values become `None` and
+never reject login. Self-hosted games and providers without this claim need no
+billing configuration or connection to Unbought Accounts.
+
+```rust
+use unbought_auth::Identity;
+
+fn supporter_label(identity: &Identity, trusted_supporter_issuer: Option<&str>) -> Option<String> {
+    if trusted_supporter_issuer != Some(identity.issuer.as_str()) {
+        return None;
+    }
+    identity.supporter_tier.map(|tier| format!("Supporter · Tier {tier}"))
+}
+```
+
+Games choose whether to display the indicator. For an Unbought supporter badge,
+trust the configured Unbought issuer; a matching claim name from another issuer
+is not evidence of an Unbought membership. Expose only the desired identity
+attributes through the game's player API, never the full `Tokens` value.
+
+Callback and refresh read the tier only after normal token validation. A current
+refresh replaces the tier, including clearing it when the claim disappears.
+Older identities cannot overwrite a newer snapshot, and issuer/subject continuity
+checks still apply. This is display metadata from a billing snapshot, not a live
+payment check or permission to grant benefits. Respect identity expiry and keep
+using normal session revalidation; no additional requests or scopes are added.
+
+Version 0.2.0 adds a public `Identity` field: consumers constructing struct
+literals must add `supporter_tier: None` (or a known tier). Existing serialized
+sessions deserialize with `None` when the field is absent, so no stored-session
+migration is needed. Recognized tiers serialize as numbers; `None` is omitted.
+
 ## Verification and license
 
 Run `make check` from the workspace root. Unit and contract tests are offline.
 The accounts service retains its separate full-system protocol acceptance suite.
-The public API and runtime implementation are preserved from the initial
-Unbought accounts integration.
+The library follows the Unbought accounts integration contract; version-specific
+consumer changes are documented above and below.
 
 Licensed under MIT. Copyright (c) 2026 Unbought Games, LLC and contributors.
 

@@ -29,6 +29,8 @@ pub enum Error {
     EmailVerificationRequired,
 }
 pub type Result<T> = std::result::Result<T, Error>;
+/// Optional display claim issued by Accounts. Every recognized tier is a supporter.
+pub const SUPPORTER_TIER_CLAIM: &str = "https://unbought.games/supporter_tier";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Configuration {
     pub issuer: String,
@@ -42,6 +44,14 @@ pub struct Identity {
     pub subject: String,
     pub username: String,
     pub email_verified: bool,
+    /// Optional supporter display tier (1, 2, or 3), scoped to this identity's issuer.
+    /// Missing or unrecognized claims do not restrict authentication or gameplay.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_supporter_tier",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub supporter_tier: Option<u8>,
     pub session_id: String,
     pub issued_at: i64,
     pub expires_at: i64,
@@ -54,6 +64,18 @@ pub struct Tokens {
     pub refresh_token: Option<String>,
     pub nonce: String,
     pub validated_at: i64,
+}
+fn supporter_tier(value: &serde_json::Value) -> Option<u8> {
+    value
+        .as_u64()
+        .filter(|tier| (1..=3).contains(tier))
+        .map(|tier| tier as u8)
+}
+fn deserialize_supporter_tier<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u8>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(supporter_tier(&value))
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LoginTransaction {
@@ -134,10 +156,15 @@ pub fn replace_identity(current: &Identity, next: Identity) -> Result<Identity> 
     if current.issuer != next.issuer || current.subject != next.subject {
         return Err(Error::AccountChanged);
     }
-    if next.issued_at < current.issued_at
-        || (next.issued_at == current.issued_at && current.email_verified && !next.email_verified)
-    {
+    if next.issued_at < current.issued_at {
         return Ok(current.clone());
+    }
+    if next.issued_at == current.issued_at && current.email_verified && !next.email_verified {
+        // Preserve the existing verification safeguard without keeping a tier
+        // that a refresh in the same issuance second has removed or changed.
+        let mut preserved = current.clone();
+        preserved.supporter_tier = next.supporter_tier;
+        return Ok(preserved);
     }
     Ok(next)
 }
@@ -361,6 +388,7 @@ impl RelyingParty {
             subject: value["sub"].as_str().ok_or(Error::Invalid)?.into(),
             username: username.into(),
             email_verified: flag.and_then(|v| v.as_bool()).unwrap_or(false),
+            supporter_tier: value.get(SUPPORTER_TIER_CLAIM).and_then(supporter_tier),
             session_id: value["sid"].as_str().ok_or(Error::Invalid)?.into(),
             issued_at: value["iat"].as_i64().ok_or(Error::Invalid)?,
             expires_at: value["exp"]
@@ -473,6 +501,59 @@ impl RelyingParty {
 mod tests {
     use super::*;
     #[test]
+    fn optional_supporter_claims_do_not_gate_identity_parsing() {
+        let party = RelyingParty::new(Configuration {
+            issuer: "https://self-hosted.example".into(),
+            client_id: "game".into(),
+            client_secret: "fixture".into(),
+            redirect_uri: "https://game.example/callback".into(),
+        })
+        .unwrap();
+        let mut payload = serde_json::json!({
+            "sub": "player", "preferred_username": "alice", "email_verified": false,
+            "sid": "session", "iat": 100, "exp": 200
+        });
+        // Exercise the post-validation extraction step only. Public callback and
+        // refresh still validate tokens through openidconnect before reaching it.
+        let parse = |payload: &serde_json::Value| {
+            let token = format!(
+                "header.{}.signature",
+                URL_SAFE_NO_PAD.encode(payload.to_string())
+            );
+            party.identity(&token)
+        };
+        let missing = parse(&payload).unwrap();
+        assert_eq!(missing.supporter_tier, None);
+        assert_eq!(missing.issuer, "https://self-hosted.example");
+        for tier in 1..=3 {
+            payload[SUPPORTER_TIER_CLAIM] = serde_json::json!(tier);
+            assert_eq!(parse(&payload).unwrap().supporter_tier, Some(tier));
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(4),
+            serde_json::json!(-1),
+            serde_json::json!(256),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(1.0),
+            serde_json::json!(1.5),
+            serde_json::json!("1"),
+            serde_json::json!(true),
+            serde_json::json!([1]),
+            serde_json::json!({"tier": 1}),
+        ] {
+            payload[SUPPORTER_TIER_CLAIM] = invalid;
+            let parsed = parse(&payload).unwrap();
+            assert_eq!(parsed.supporter_tier, None);
+            assert_eq!(parsed.subject, missing.subject);
+            assert_eq!(parsed.email_verified, missing.email_verified);
+        }
+        // Optional metadata does not relax the required identity contract.
+        payload["email_verified"] = serde_json::json!("true");
+        assert!(matches!(parse(&payload), Err(Error::Invalid)));
+    }
+    #[test]
     fn logout_rejects_even_a_null_nonce() {
         let value = serde_json::json!({"iss":"issuer","aud":"client","sid":"session","jti":"event","iat":1,"exp":2,"events":{},"nonce":null});
         assert!(serde_json::from_value::<Logout>(value).is_err());
@@ -491,6 +572,7 @@ mod tests {
             subject: "id".into(),
             username: "alice".into(),
             email_verified: true,
+            supporter_tier: None,
             session_id: "session".into(),
             issued_at: 20,
             expires_at: 100,

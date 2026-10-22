@@ -23,6 +23,7 @@ fn identity() -> Identity {
         subject: "player-id".into(),
         username: "player".into(),
         email_verified: true,
+        supporter_tier: None,
         session_id: "session-id".into(),
         issued_at: 100,
         expires_at: 200,
@@ -68,7 +69,8 @@ fn loopback_configuration_is_available_without_an_account_service() {
 
 #[test]
 fn identity_updates_never_cross_subject_or_issuer() {
-    let current = identity();
+    let mut current = identity();
+    current.supporter_tier = Some(3);
     let mut other_subject = current.clone();
     other_subject.subject = "another-player".into();
     let mut other_issuer = current.clone();
@@ -79,6 +81,99 @@ fn identity_updates_never_cross_subject_or_issuer() {
             Err(Error::AccountChanged)
         ));
     }
+}
+
+#[test]
+fn stored_identities_keep_supporter_tiers_optional_and_numeric() {
+    let mut legacy = serde_json::to_value(identity()).unwrap();
+    assert!(legacy.get("supporter_tier").is_none());
+    assert_eq!(
+        serde_json::from_value::<Identity>(legacy.clone()).unwrap(),
+        identity()
+    );
+    for tier in 1..=3 {
+        let mut supporter = identity();
+        supporter.supporter_tier = Some(tier);
+        let serialized = serde_json::to_value(&supporter).unwrap();
+        assert_eq!(serialized["supporter_tier"], serde_json::json!(tier));
+        assert_eq!(
+            serde_json::from_value::<Identity>(serialized).unwrap(),
+            supporter
+        );
+    }
+    for invalid in [
+        serde_json::Value::Null,
+        serde_json::json!(0),
+        serde_json::json!(4),
+        serde_json::json!(-1),
+        serde_json::json!(256),
+        serde_json::json!(1.0),
+        serde_json::json!("1"),
+        serde_json::json!(true),
+        serde_json::json!([1]),
+        serde_json::json!({"tier": 1}),
+    ] {
+        legacy["supporter_tier"] = invalid;
+        assert_eq!(
+            serde_json::from_value::<Identity>(legacy.clone()).unwrap(),
+            identity()
+        );
+    }
+    // Existing persisted sessions also deserialize without a migration.
+    legacy.as_object_mut().unwrap().remove("supporter_tier");
+    let stored = serde_json::json!({
+        "client_id": "game", "identity": legacy, "access_token": "access",
+        "refresh_token": "refresh", "nonce": "nonce", "validated_at": 100
+    });
+    assert_eq!(
+        serde_json::from_value::<unbought_auth::Tokens>(stored)
+            .unwrap()
+            .identity
+            .supporter_tier,
+        None
+    );
+}
+
+#[test]
+fn refresh_replaces_or_clears_supporter_tiers_without_resurrecting_stale_status() {
+    let mut current = identity();
+    current.supporter_tier = Some(3);
+    let mut stale = current.clone();
+    stale.issued_at -= 1;
+    stale.supporter_tier = Some(1);
+    assert_eq!(replace_identity(&current, stale).unwrap(), current);
+
+    for tier in [None, Some(1), Some(2), Some(3)] {
+        let mut next = current.clone();
+        next.issued_at += 1;
+        next.supporter_tier = tier;
+        assert_eq!(
+            replace_identity(&current, next).unwrap().supporter_tier,
+            tier
+        );
+    }
+    // Token timestamps have one-second precision. Verification preservation
+    // must not accidentally keep a removed supporter tier in that second.
+    let mut same_second = current.clone();
+    same_second.email_verified = false;
+    same_second.supporter_tier = None;
+    let cleared = replace_identity(&current, same_second).unwrap();
+    assert!(cleared.email_verified);
+    assert_eq!(cleared.supporter_tier, None);
+    assert_eq!(
+        replace_identity(&cleared, current.clone())
+            .unwrap()
+            .supporter_tier,
+        Some(3)
+    );
+    let mut old_supporter = current;
+    old_supporter.issued_at -= 1;
+    assert_eq!(
+        replace_identity(&cleared, old_supporter)
+            .unwrap()
+            .supporter_tier,
+        None
+    );
 }
 
 #[test]
