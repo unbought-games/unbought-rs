@@ -1,5 +1,6 @@
 //! OIDC protocol integration. Consumers own HTTP, cookies, durable transactions and sessions.
 #![doc = include_str!("../README.md")]
+mod profiles;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use openidconnect::{
     AccessTokenHash, AsyncHttpClient, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
@@ -7,6 +8,7 @@ use openidconnect::{
     PkceCodeVerifier, RedirectUrl, RefreshToken, RequestTokenError, Scope, TokenResponse,
     core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata, CoreRequestTokenError},
 };
+pub use profiles::{ProfileError, ProfileSnapshot, PublicProfile, PublicProfileClient};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{

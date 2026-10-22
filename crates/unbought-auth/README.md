@@ -146,3 +146,58 @@ registry pins and lockfiles in their own reviewed release.
 Version 0.1.3 keeps callback, refresh, and revalidation futures `Send` when awaited
 inside HTTP handlers. It replaces the 0.1.2 closure adapter with an explicit HTTP
 client adapter; transient failure classification is unchanged.
+
+## Public game profiles (0.2.1)
+
+Public profiles use a separate server-only service credential approved for your
+OIDC client. They require no player tokens and survive ordinary player logout.
+Only users who successfully authorized that client can be returned. Existing
+Accounts users need one new successful sign-in after the endpoint is deployed;
+refresh alone does not establish the durable association.
+
+```rust,no_run
+use unbought_auth::{PublicProfileClient, ProfileError};
+
+async fn load_visible_players(subjects: &[String], secret: &str) -> Result<(), ProfileError> {
+    let client = PublicProfileClient::new(
+        "https://accounts.unbought.games",
+        "https://accounts.unbought.games/api/auth",
+        secret,
+    )?;
+    let snapshot = client.batch(subjects).await?;
+    for profile in snapshot.profiles {
+        // Attach only these public fields to an already-authorized game view.
+        // Cache no later than profile.expires_at (UTC Unix seconds).
+        println!("{}: {:?}", profile.username, profile.supporter_tier);
+    }
+    Ok(())
+}
+```
+
+The base URL is the Accounts origin, optionally with a deployment path prefix;
+`/api/game-profiles/v1/batch` is appended. The issuer must match exactly. HTTPS is
+required except loopback development. Requests accept 1–100 subjects of 1–255
+Unicode characters (excluding NUL); the size limit applies before deduplication.
+The client uses three-second connect and five-second total timeouts, never follows
+redirects, and limits successful response bodies to 256 KiB. Configuration and
+network errors never expose the credential; Debug output is redacted.
+
+`ProfileError` distinguishes `InvalidRequest`, `Unauthenticated`, `Forbidden`,
+`RateLimited { retry_after: Duration }`, `Unavailable`, and `InvalidResponse`.
+It rejects wrong issuers, duplicate/unrequested subjects, malformed required
+fields, expired snapshots and validity beyond five minutes. Unknown optional tiers
+become `None`, preserving normal gameplay. No retries are performed automatically.
+
+Reuse the client for pooled requests. Cache by issuer, OIDC client and subject;
+retain snapshots only until their explicit `expires_at`. A successful response
+replaces **all requested entries**, clearing entries omitted by Accounts. A failed
+request may retain unexpired entries only; after expiry use the game's existing
+identity and no badge. Respect expiry in already-open browser views. This display
+API must never gate gameplay or expose an arbitrary account lookup proxy.
+
+For rotation, have the Accounts operator provision a second profile credential,
+replace the client instance using the new secret, then revoke the old credential.
+Immediate operator rotation revokes all previous credentials and requires prompt
+server reconfiguration. Credentials belong in a server secret store, never in
+browser code, URLs, player sessions or logs. Default server budgets are 300 requests
+per client and 600 per source per minute; honor Retry-After and batch/shared caches.
