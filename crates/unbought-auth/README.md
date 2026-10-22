@@ -89,3 +89,19 @@ The public API and runtime implementation are preserved from the initial
 Unbought accounts integration.
 
 Licensed under MIT. Copyright (c) 2026 Unbought Games, LLC and contributors.
+
+## Token endpoint failures
+
+Version 0.1.2 preserves transient failures during both authorization-code exchange
+and refresh: HTTP 429, HTTP 5xx, network failures, and OAuth `server_error` or
+`temporarily_unavailable` return `Error::Unavailable`. HTTP status is checked before
+parsing the response body, so Accounts' message-only 429 and proxy HTML outages
+are classified correctly. Invalid grants/client credentials, malformed successful
+responses, account-action errors, and failed identity checks remain invalid.
+
+No automatic retry or session acceptance is added. Callback transactions remain
+single-use; consumers should offer a fresh login after a transient callback
+failure. Orbit already maps `Unavailable` to HTTP 503. The library does not forward
+provider retry headers; callers should use backoff for unavailable responses.
+Publish this patch through the repository release procedure, then update consumers'
+registry pins and lockfiles in their own reviewed release.
